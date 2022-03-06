@@ -4,13 +4,14 @@
 // 2022 - https://github.com/morgverd/simplified-sentry-transactions
 
 class EasySentryTransaction {
+    public bool $autoFinishOnShutdown = true;
     function __construct(\Sentry\Tracing\Transaction $_t) {
         $this->_t = $_t;
     }
 
     // Start a span under the current Transaction with the provided parameters. Then
     // set the created span as the current span in the Sentry Hub.
-    function createSpan(string $operation, ?string $description = null): \Sentry\Tracing\Span {
+    function createSpan(string $operation, ?string $description = null, bool $setSpan = false): \Sentry\Tracing\Span {
 
         // Create the base span context with provided parameters. If there
         // is a provided description for the span then we should also apply that.
@@ -21,9 +22,12 @@ class EasySentryTransaction {
         }
 
         // Start the span with the transaction parent and then set
-        // it as the current span for the Sentry hub.
+        // it as the current span for the Sentry hub if the parameter
+        // is enabled.
         $span = $this->_t->startChild($context);
-        \Sentry\SentrySdk::getCurrentHub()->setSpan($span);
+        if ($setSpan) {
+            \Sentry\SentrySdk::getCurrentHub()->setSpan($span);
+        }
 
         return $span;
     }
@@ -40,6 +44,13 @@ class EasySentryTransaction {
 
     // Finish the transaction, submitting the transaction and its spans to Sentry.
     function finish(): void {
+
+        // If the current transaction is this transaction, then we should reset it.
+        if (SentryPreformance::$currentTransaction === $this->_t) {
+            SentryPreformance::$currentTransaction = null;
+        }
+
+        // Finally, finish the transaction.
         $this->_t->finish();
     }
 
@@ -56,7 +67,7 @@ class EasySentryTransaction {
 }
 
 class SentryPreformance {
-    
+
     // This allows for a function to be directly wrapped inside of a measurement call. If Sentry is not being
     // used then the call will execute as normal without any measurement applied ontop of it. The value returned
     // is the same value that is returned from the callable. Example usage:
@@ -121,8 +132,8 @@ class SentryPreformance {
     //  IT IS VITAL THAT ANY STARTED MEASUREMENT IS ENDED TO AVOID MEMORY LEAKS. USING THE "measureWrapper" FUNCTION
     //  WILL TAKE CARE OF THIS AUTOMATICALLY INSTEAD. IF YOU DECIDE TO CALL THIS MANUALLY PLEASE FOR THE LOVE OF CHRIST
     //  ALSO REMEMBER TO END IT AS SOON AS POSSIBLE.
-
-    public static function getNewTransaction(string $name, string $operation): ?EasySentryTransaction {
+    public static ?EasySentryTransaction $currentTransaction = null;
+    public static function getNewTransaction(string $name, string $operation): Blackhole|EasySentryTransaction {
 
         // Setup context for the full transaction
         $transactionContext = new \Sentry\Tracing\TransactionContext();
@@ -136,6 +147,44 @@ class SentryPreformance {
 
         // Finally, return the created transaction wrapped in an EasySentryTransaction to make things slightly
         // easier later on.
-        return new EasySentryTransaction($transaction);
+        $easyTransaction = new EasySentryTransaction($transaction);
+        self::$currentTransaction = $easyTransaction;
+
+        return $easyTransaction;
+    }
+
+    // This can be used to allow for utilities to interact with whatever Transaction called them. If a Transaction
+    // was found it will be automatically wrapped in the EasySentryTransaction handler. 
+    static function getCurrentTransaction(): ?EasySentryTransaction {
+        if (is_null(self::$currentTransaction)) { return null; }
+        return self::$currentTransaction;
+    }
+    
+    // Resolves the given span in the provided transaction. If a transaction is not provided the current transaction
+    // is used instead.
+    static function finishSpan(?\Sentry\Tracing\Span $span, ?EasySentryTransaction $transaction = null): void {
+        if (is_null($span)) { return; } // If there is no provided span, we cannot resolve at all.
+        if (is_null($transaction)) {
+            
+            // No transaction provided, use the current.
+            if (is_null(self::$currentTransaction)) {
+
+                // There is no provided transaction, and there is no current transaction to use for resolving.
+                return;
+            
+            }
+            $transaction = self::$currentTransaction;
+        }
+
+        $transaction->finishSpan($span);
     }
 }
+
+// Automatically finish the current transaction on shutdown.
+register_shutdown_function(function() {
+    if (!is_null(SentryPreformance::$currentTransaction)) {
+        if (SentryPreformance::$currentTransaction->autoFinishOnShutdown) {
+            SentryPreformance::$currentTransaction->finish();
+        }
+    }
+});
